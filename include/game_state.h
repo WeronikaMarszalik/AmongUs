@@ -24,6 +24,7 @@ typedef struct Player {
     bool alive;
     bool voted;
     int vote_target;
+    unsigned int completed_tasks;
     int x;
     int y;
     char name[MAX_NAME_LEN + 1];
@@ -43,6 +44,7 @@ typedef struct GameState {
     GamePhase phase;
     int next_player_id;
     int task_count;
+    int task_goal;
     int state_version;
     char winner[64];
 } GameState;

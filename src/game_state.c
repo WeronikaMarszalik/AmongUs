@@ -1,6 +1,8 @@
 #include "game_state.h"
 #include <stdio.h>
 #include <string.h>
+#include <stdlib.h>
+#include <time.h>
 
 static Player *find_player(GameState *state, int player_id) {
     for (int i = 0; i < MAX_PLAYERS; i++) {
@@ -127,7 +129,7 @@ static void check_win_conditions(GameState *state) {
         finish_game(state, "CREWMATES");
     } else if (alive_impostors(state) >= alive_crewmates(state)) {
         finish_game(state, "IMPOSTORS");
-    } else if (state->task_count >= TASKS_TO_WIN) {
+    } else if (state->task_goal > 0 && state->task_count >= state->task_goal) {
         finish_game(state, "CREWMATES_BY_TASKS");
     }
 }
@@ -139,6 +141,16 @@ static void reset_votes(GameState *state) {
     }
 }
 
+static int random_between(int min_value, int max_value) {
+    static bool seeded = false;
+    if (!seeded) {
+        srand((unsigned int)time(NULL));
+        seeded = true;
+    }
+    if (max_value <= min_value) return min_value;
+    return min_value + rand() % (max_value - min_value + 1);
+}
+
 static void reset_players_for_lobby(GameState *state) {
     int slot = 0;
     for (int i = 0; i < MAX_PLAYERS; i++) {
@@ -147,6 +159,7 @@ static void reset_players_for_lobby(GameState *state) {
             state->players[i].role = ROLE_UNKNOWN;
             state->players[i].voted = false;
             state->players[i].vote_target = -1;
+            state->players[i].completed_tasks = 0;
             state->players[i].x = 2 + (slot % 4);
             state->players[i].y = 2 + (slot / 4);
             slot++;
@@ -155,10 +168,26 @@ static void reset_players_for_lobby(GameState *state) {
     clear_bodies(state);
 }
 
+static void place_players_for_round(GameState *state) {
+    static const int starts[MAX_PLAYERS][2] = {
+        {2, 2}, {3, 2}, {2, 3}, {3, 3}, {5, 2},
+        {5, 3}, {7, 2}, {7, 3}, {8, 3}, {10, 2}
+    };
+    int slot = 0;
+    for (int i = 0; i < MAX_PLAYERS; i++) {
+        if (state->players[i].connected) {
+            state->players[i].x = starts[slot][0];
+            state->players[i].y = starts[slot][1];
+            slot++;
+        }
+    }
+}
+
 void game_init(GameState *state) {
     memset(state, 0, sizeof(*state));
     state->phase = PHASE_LOBBY;
     state->next_player_id = 1;
+    state->task_goal = 0;
     state->state_version = 1;
     state->winner[0] = '\0';
     for (int i = 0; i < MAX_PLAYERS; i++) {
@@ -182,6 +211,7 @@ int game_add_player(GameState *state, int socket_fd, const char *name, char *mes
             player->alive = true;
             player->voted = false;
             player->vote_target = -1;
+            player->completed_tasks = 0;
             player->x = 2 + (i % 4);
             player->y = 2 + (i / 4);
             player->role = ROLE_UNKNOWN;
@@ -223,20 +253,24 @@ void game_start(GameState *state, int player_id, char *message, int message_size
         snprintf(message, message_size, "ERROR Potrzeba co najmniej %d graczy", MIN_PLAYERS_TO_START);
         return;
     }
-    bool impostor_assigned = false;
+    int impostor_slot = players > 1 ? random_between(0, players - 1) : -1;
+    int alive_slot = 0;
     for (int i = 0; i < MAX_PLAYERS; i++) {
         if (state->players[i].connected) {
             state->players[i].alive = true;
+            state->players[i].completed_tasks = 0;
             if (players == 1) {
                 state->players[i].role = ROLE_CREWMATE;
             } else {
-                state->players[i].role = impostor_assigned ? ROLE_CREWMATE : ROLE_IMPOSTOR;
-                impostor_assigned = true;
+                state->players[i].role = alive_slot == impostor_slot ? ROLE_IMPOSTOR : ROLE_CREWMATE;
+                alive_slot++;
             }
         }
     }
     state->task_count = 0;
+    state->task_goal = alive_crewmates(state) * TASK_SPOT_COUNT;
     clear_bodies(state);
+    place_players_for_round(state);
     state->phase = PHASE_RUNNING;
     state->winner[0] = '\0';
     reset_votes(state);
@@ -255,6 +289,7 @@ void game_reset_to_lobby(GameState *state, int player_id, char *message, int mes
     }
     state->phase = PHASE_LOBBY;
     state->task_count = 0;
+    state->task_goal = 0;
     state->winner[0] = '\0';
     reset_players_for_lobby(state);
     snprintf(message, message_size, "INFO Powrot do lobby");
@@ -274,11 +309,13 @@ void game_move_player(GameState *state, int player_id, int dx, int dy, char *mes
     }
     int next_x = player->x + dx;
     int next_y = player->y + dy;
-    if (next_x < 0 || next_x >= MAP_WIDTH || next_y < 0 || next_y >= MAP_HEIGHT) {
+    int max_x = state->phase == PHASE_LOBBY ? 9 : MAP_WIDTH - 1;
+    int max_y = state->phase == PHASE_LOBBY ? 6 : MAP_HEIGHT - 1;
+    if (next_x < 1 || next_x >= max_x || next_y < 1 || next_y >= max_y) {
         snprintf(message, message_size, "ERROR Poza mapa");
         return;
     }
-    if (is_wall_at(next_x, next_y)) {
+    if (state->phase == PHASE_RUNNING && is_wall_at(next_x, next_y)) {
         snprintf(message, message_size, "ERROR Sciana blokuje przejscie");
         return;
     }
@@ -294,19 +331,24 @@ void game_complete_task(GameState *state, int player_id, char *message, int mess
         snprintf(message, message_size, "ERROR Zadanie moze wykonac tylko zywy crewmate podczas gry");
         return;
     }
-    bool on_task_spot = false;
+    int task_index = -1;
     for (int i = 0; i < TASK_SPOT_COUNT; i++) {
         if (TASK_SPOTS[i][0] == player->x && TASK_SPOTS[i][1] == player->y) {
-            on_task_spot = true;
+            task_index = i;
             break;
         }
     }
-    if (!on_task_spot) {
+    if (task_index < 0) {
         snprintf(message, message_size, "ERROR Musisz stac na polu zadania T");
         return;
     }
+    if (player->completed_tasks & (1u << task_index)) {
+        snprintf(message, message_size, "ERROR Ten task zostal juz wykonany przez tego gracza");
+        return;
+    }
+    player->completed_tasks |= (1u << task_index);
     state->task_count++;
-    snprintf(message, message_size, "INFO %s wykonuje zadanie (%d/%d)", player->name, state->task_count, TASKS_TO_WIN);
+    snprintf(message, message_size, "INFO %s wykonuje zadanie (%d/%d)", player->name, state->task_count, state->task_goal);
     mark_changed(state);
     check_win_conditions(state);
 }
@@ -332,6 +374,10 @@ void game_vote(GameState *state, int player_id, int target_id, char *message, in
     Player *player = find_player(state, player_id);
     if (!player || state->phase != PHASE_MEETING || !player->alive) {
         snprintf(message, message_size, "ERROR Glosowanie jest teraz niedozwolone");
+        return;
+    }
+    if (player->voted) {
+        snprintf(message, message_size, "ERROR Oddales juz glos w tym spotkaniu");
         return;
     }
     if (target_id != 0) {
@@ -439,8 +485,9 @@ void game_build_state_message(const GameState *state, char *buffer, int buffer_s
     if (state->phase == PHASE_MEETING) phase = "MEETING";
     if (state->phase == PHASE_FINISHED) phase = "FINISHED";
 
+    int task_goal = state->task_goal > 0 ? state->task_goal : TASK_SPOT_COUNT;
     int written = snprintf(buffer, buffer_size, "STATE version=%d phase=%s map=%dx%d tasks=%d/%d winner=%s taskspots=",
-                           state->state_version, phase, MAP_WIDTH, MAP_HEIGHT, state->task_count, TASKS_TO_WIN,
+                           state->state_version, phase, MAP_WIDTH, MAP_HEIGHT, state->task_count, task_goal,
                            state->winner[0] ? state->winner : "-");
     for (int i = 0; i < TASK_SPOT_COUNT && written < buffer_size; i++) {
         int added = snprintf(buffer + written, buffer_size - written,

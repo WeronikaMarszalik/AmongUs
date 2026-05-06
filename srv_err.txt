@@ -1,0 +1,5 @@
+DEBUG create begin CREATE Test Ala
+DEBUG created idx 0
+DEBUG add player 1 msg WELCOME 1 Witaj Ala
+DEBUG sent welcome
+DEBUG broadcast state

@@ -28,7 +28,8 @@ typedef enum TaskMode {
 typedef enum TaskKind {
     TASK_KIND_NONE,
     TASK_KIND_PROGRESS,
-    TASK_KIND_CODE
+    TASK_KIND_CODE,
+    TASK_KIND_CARD
 } TaskKind;
 
 typedef struct ViewPlayer {
@@ -56,6 +57,8 @@ typedef struct ViewState {
     int local_player_id;
     char phase[24];
     char winner[64];
+    char vote_result[128];
+    int vote_result_version;
     ViewPlayer players[MAX_PLAYERS];
     int player_count;
     ViewBody bodies[MAX_PLAYERS];
@@ -70,6 +73,12 @@ typedef struct ClientRuntime {
     ViewState view;
 } ClientRuntime;
 
+static int parse_welcome_player_id(const char *line) {
+    int id = -1;
+    if (sscanf(line, "WELCOME %d", &id) == 1) return id;
+    return -1;
+}
+
 typedef struct Assets {
     TTF_Font *font;
     TTF_Font *small_font;
@@ -79,12 +88,20 @@ typedef struct Assets {
 typedef struct TaskUi {
     TaskMode mode;
     TaskKind kind;
+    int task_index;
     Uint32 started_at;
     int series_done;
+    int card_steps;
     char code[5];
     char input[5];
     char status[96];
 } TaskUi;
+
+typedef struct VoteUi {
+    char input[8];
+    int vote_sent;
+    char message[96];
+} VoteUi;
 
 static void copy_text(char *dest, int dest_size, const char *source) {
     if (dest_size <= 0) return;
@@ -113,6 +130,13 @@ static void init_view(ViewState *view) {
     copy_text(view->phase, sizeof(view->phase), "LOBBY");
     copy_text(view->winner, sizeof(view->winner), "-");
     copy_text(view->last_message, sizeof(view->last_message), "Dolaczanie do lobby...");
+}
+
+static void remember_vote_result(ViewState *view, const char *line) {
+    if (strstr(line, "zostaje wyrzucony") || strstr(line, "Glosowanie bez wyrzucenia")) {
+        copy_text(view->vote_result, sizeof(view->vote_result), line);
+        view->vote_result_version++;
+    }
 }
 
 static void parse_task_spots(ViewState *view, const char *spots) {
@@ -197,10 +221,8 @@ static void parse_state_line(ViewState *view, const char *line) {
 }
 
 static void parse_welcome(ViewState *view, const char *line) {
-    int id = -1;
-    if (sscanf(line, "WELCOME %d", &id) == 1) {
-        view->local_player_id = id;
-    }
+    int id = parse_welcome_player_id(line);
+    if (id > 0) view->local_player_id = id;
 }
 
 static int read_until_prefix(SOCKET socket_fd, const char *prefix, char *out, int out_size) {
@@ -261,6 +283,7 @@ static DWORD WINAPI receive_thread(LPVOID parameter) {
             if (strncmp(line, "WELCOME ", 8) == 0) {
                 parse_welcome(&runtime->view, line);
             }
+            remember_vote_result(&runtime->view, line);
             copy_text(runtime->view.last_message, sizeof(runtime->view.last_message), line);
         }
         LeaveCriticalSection(&runtime->view_mutex);
@@ -340,10 +363,19 @@ static const ViewPlayer *local_player(const ViewState *view) {
 static TaskKind task_kind_at(const ViewState *view, int x, int y) {
     for (int i = 0; i < view->task_spot_count; i++) {
         if (view->task_spots[i][0] == x && view->task_spots[i][1] == y) {
-            return view->task_types[i] == 'C' ? TASK_KIND_CODE : TASK_KIND_PROGRESS;
+            if (view->task_types[i] == 'C') return TASK_KIND_CODE;
+            if (view->task_types[i] == 'S') return TASK_KIND_CARD;
+            return TASK_KIND_PROGRESS;
         }
     }
     return TASK_KIND_NONE;
+}
+
+static int task_index_at(const ViewState *view, int x, int y) {
+    for (int i = 0; i < view->task_spot_count; i++) {
+        if (view->task_spots[i][0] == x && view->task_spots[i][1] == y) return i;
+    }
+    return -1;
 }
 
 static int body_near_local_player(const ViewState *view) {
@@ -359,6 +391,13 @@ static int body_near_local_player(const ViewState *view) {
     return 0;
 }
 
+static const ViewPlayer *find_view_player(const ViewState *view, int player_id) {
+    for (int i = 0; i < view->player_count; i++) {
+        if (view->players[i].id == player_id) return &view->players[i];
+    }
+    return NULL;
+}
+
 static void generate_task_code(TaskUi *task) {
     for (int i = 0; i < 4; i++) {
         task->code[i] = (char)('0' + rand() % 10);
@@ -367,23 +406,27 @@ static void generate_task_code(TaskUi *task) {
     task->input[0] = '\0';
 }
 
-static void start_task_ui(TaskUi *task, TaskKind kind) {
+static void start_task_ui(TaskUi *task, TaskKind kind, int task_index) {
     memset(task, 0, sizeof(*task));
     task->kind = kind;
+    task->task_index = task_index;
     task->mode = kind == TASK_KIND_CODE ? TASK_UI_SHOW_CODE : TASK_UI_PROGRESS;
     task->started_at = SDL_GetTicks();
     if (kind == TASK_KIND_CODE) {
         generate_task_code(task);
         copy_text(task->status, sizeof(task->status), "Zapamietaj kod");
         SDL_StartTextInput();
+    } else if (kind == TASK_KIND_CARD) {
+        copy_text(task->status, sizeof(task->status), "Swipe card: naciskaj strzalke w prawo");
     } else {
         copy_text(task->status, sizeof(task->status), "Downloading data...");
     }
 }
 
-static void advance_task_ui(TaskUi *task, ClientRuntime *runtime) {
+static void advance_task_ui(TaskUi *task, ClientRuntime *runtime, unsigned int *local_completed_tasks) {
     Uint32 now = SDL_GetTicks();
-    if (task->mode == TASK_UI_PROGRESS && now - task->started_at >= TASK_PROGRESS_MS) {
+    if (task->mode == TASK_UI_PROGRESS && task->kind == TASK_KIND_PROGRESS &&
+        now - task->started_at >= TASK_PROGRESS_MS) {
         task->mode = TASK_UI_DONE;
         task->started_at = now;
         copy_text(task->status, sizeof(task->status), "Progress task complete");
@@ -393,6 +436,9 @@ static void advance_task_ui(TaskUi *task, ClientRuntime *runtime) {
         copy_text(task->status, sizeof(task->status), "Wpisz kod");
     } else if (task->mode == TASK_UI_DONE && now - task->started_at >= 550) {
         net_send_line(runtime->socket_fd, "TASK");
+        if (task->task_index >= 0) {
+            *local_completed_tasks |= (1u << task->task_index);
+        }
         task->mode = TASK_UI_NONE;
         SDL_StopTextInput();
     }
@@ -463,8 +509,8 @@ static void render_lobby(SDL_Renderer *renderer, Assets *assets, const ViewState
     draw_button(renderer, assets->font, 735, 365, 170, 56, "START  X", (SDL_Color){42, 154, 86, 255});
 
     for (int i = 0; i < view->player_count; i++) {
-        int px = 170 + (view->players[i].x % 8) * 58;
-        int py = 220 + (view->players[i].y % 4) * 58;
+        int px = 135 + view->players[i].x * 64;
+        int py = 160 + view->players[i].y * 64;
         draw_bean(renderer, assets->small_font, &view->players[i], px, py, view->players[i].id == view->local_player_id);
     }
     draw_text(renderer, assets->small_font, view->last_message, 90, 555, (SDL_Color){235, 240, 245, 255});
@@ -519,7 +565,7 @@ static void apply_crewmate_vision(SDL_Renderer *renderer, const ViewState *view,
     }
 }
 
-static void render_game(SDL_Renderer *renderer, Assets *assets, const ViewState *view) {
+static void render_game(SDL_Renderer *renderer, Assets *assets, const ViewState *view, const VoteUi *vote_ui) {
     const ViewPlayer *me = local_player(view);
     int camera_x = me ? me->x * TILE_SIZE - WINDOW_WIDTH / 2 : 0;
     int camera_y = me ? me->y * TILE_SIZE - WINDOW_HEIGHT / 2 : 0;
@@ -554,9 +600,12 @@ static void render_game(SDL_Renderer *renderer, Assets *assets, const ViewState 
         int sy = view->task_spots[i][1] * TILE_SIZE - camera_y + 18;
         SDL_Color terminal_color = view->task_types[i] == 'C'
             ? (SDL_Color){90, 170, 245, 255}
-            : (SDL_Color){238, 190, 66, 255};
+            : view->task_types[i] == 'S'
+                ? (SDL_Color){218, 90, 180, 255}
+                : (SDL_Color){238, 190, 66, 255};
         fill_rect(renderer, sx, sy, 42, 42, terminal_color);
-        draw_text(renderer, assets->small_font, view->task_types[i] == 'C' ? "CODE" : "LOAD",
+        draw_text(renderer, assets->small_font,
+                  view->task_types[i] == 'C' ? "CODE" : view->task_types[i] == 'S' ? "CARD" : "LOAD",
                   sx - 4, sy + 48, (SDL_Color){255, 245, 185, 255});
     }
 
@@ -598,14 +647,28 @@ static void render_game(SDL_Renderer *renderer, Assets *assets, const ViewState 
     if (strcmp(view->phase, "MEETING") == 0) {
         fill_rect(renderer, 130, 96, 700, 430, (SDL_Color){36, 40, 48, 245});
         draw_text(renderer, assets->large_font, "EMERGENCY MEETING", 230, 120, (SDL_Color){255, 230, 120, 255});
+        const ViewPlayer *meeting_me = local_player(view);
+        int can_vote = meeting_me && meeting_me->alive && !vote_ui->vote_sent;
         for (int i = 0; i < view->player_count; i++) {
             char row[96];
             snprintf(row, sizeof(row), "%d  %s  %s", view->players[i].id, view->players[i].name,
                      view->players[i].alive ? "alive" : "dead");
-            draw_text(renderer, assets->font, row, 230, 195 + i * 34, (SDL_Color){235, 240, 245, 255});
+            draw_text(renderer, assets->font, row, 230, 195 + i * 34,
+                      view->players[i].alive ? (SDL_Color){235, 240, 245, 255} : (SDL_Color){120, 125, 135, 255});
         }
-        draw_text(renderer, assets->font, "Press V and type player id in terminal, or 0 to skip",
-                  230, 460, (SDL_Color){255, 255, 255, 255});
+        if (!meeting_me || !meeting_me->alive) {
+            draw_text(renderer, assets->font, "You are dead - you cannot vote", 230, 450, (SDL_Color){240, 80, 90, 255});
+        } else if (vote_ui->vote_sent) {
+            draw_text(renderer, assets->font, "Vote sent. Waiting for others...", 230, 450, (SDL_Color){61, 213, 74, 255});
+        } else if (can_vote) {
+            char prompt[128];
+            snprintf(prompt, sizeof(prompt), "Type alive player ID and press Enter, or 0 to skip: %s",
+                     vote_ui->input[0] ? vote_ui->input : "_");
+            draw_text(renderer, assets->font, prompt, 230, 450, (SDL_Color){255, 255, 255, 255});
+        }
+        if (vote_ui->message[0]) {
+            draw_text(renderer, assets->small_font, vote_ui->message, 230, 486, (SDL_Color){255, 220, 120, 255});
+        }
     }
 
     if (strcmp(view->phase, "FINISHED") == 0) {
@@ -615,6 +678,15 @@ static void render_game(SDL_Renderer *renderer, Assets *assets, const ViewState 
         draw_text(renderer, assets->large_font, text, 320, 270, (SDL_Color){255, 255, 255, 255});
         draw_text(renderer, assets->font, "Press L to return to lobby", 340, 335, (SDL_Color){255, 230, 120, 255});
     }
+}
+
+static void render_killed_overlay(SDL_Renderer *renderer, Assets *assets, const ViewState *view) {
+    const ViewPlayer *me = local_player(view);
+    if (!me || me->alive || strcmp(view->phase, "LOBBY") == 0 || strcmp(view->phase, "FINISHED") == 0) return;
+    if (strcmp(view->phase, "MEETING") == 0) return;
+    fill_rect(renderer, 0, 0, WINDOW_WIDTH, WINDOW_HEIGHT, (SDL_Color){0, 0, 0, 245});
+    draw_text(renderer, assets->large_font, "YOU'VE BEEN KILLED", 260, 255, (SDL_Color){235, 235, 235, 255});
+    draw_text(renderer, assets->font, "Wait for the meeting or game end", 315, 325, (SDL_Color){150, 155, 165, 255});
 }
 
 static void render_task_overlay(SDL_Renderer *renderer, Assets *assets, const TaskUi *task) {
@@ -629,11 +701,24 @@ static void render_task_overlay(SDL_Renderer *renderer, Assets *assets, const Ta
 
     if (task->mode == TASK_UI_PROGRESS) {
         int w = 410;
-        int elapsed = (int)(SDL_GetTicks() - task->started_at);
-        int fill = elapsed >= TASK_PROGRESS_MS ? w : (w * elapsed) / TASK_PROGRESS_MS;
+        int fill = 0;
+        if (task->kind == TASK_KIND_CARD) {
+            fill = (w * task->card_steps) / 7;
+        } else {
+            int elapsed = (int)(SDL_GetTicks() - task->started_at);
+            fill = elapsed >= TASK_PROGRESS_MS ? w : (w * elapsed) / TASK_PROGRESS_MS;
+        }
         fill_rect(renderer, 275, 285, w, 34, (SDL_Color){45, 52, 60, 255});
         fill_rect(renderer, 275, 285, fill, 34, (SDL_Color){61, 213, 74, 255});
-        draw_text(renderer, assets->small_font, "Progress task: poczekaj az pasek sie wypelni", 305, 340, (SDL_Color){190, 205, 215, 255});
+        if (task->kind == TASK_KIND_CARD) {
+            int card_x = 285 + task->card_steps * 52;
+            fill_rect(renderer, 285, 245, 390, 22, (SDL_Color){70, 78, 86, 255});
+            fill_rect(renderer, card_x, 228, 86, 54, (SDL_Color){230, 230, 218, 255});
+            fill_rect(renderer, card_x + 12, 244, 62, 8, (SDL_Color){60, 80, 115, 255});
+            draw_text(renderer, assets->small_font, "CARD task: naciskaj strzalke w prawo", 335, 340, (SDL_Color){190, 205, 215, 255});
+        } else {
+            draw_text(renderer, assets->small_font, "Progress task: poczekaj az pasek sie wypelni", 305, 340, (SDL_Color){190, 205, 215, 255});
+        }
     } else if (task->mode == TASK_UI_SHOW_CODE) {
         draw_text(renderer, assets->large_font, task->code, 425, 280, (SDL_Color){255, 230, 120, 255});
         char series[64];
@@ -660,33 +745,47 @@ static void render_role_overlay(SDL_Renderer *renderer, Assets *assets, const ch
     }
 }
 
+static void render_vote_result_overlay(SDL_Renderer *renderer, Assets *assets, const char *message) {
+    if (!message || message[0] == '\0') return;
+    fill_rect(renderer, 185, 230, 590, 150, (SDL_Color){10, 12, 18, 238});
+    SDL_Rect outline = {185, 230, 590, 150};
+    set_color(renderer, (SDL_Color){235, 240, 245, 255});
+    SDL_RenderDrawRect(renderer, &outline);
+    draw_text(renderer, assets->large_font, "VOTING RESULT", 305, 252, (SDL_Color){255, 230, 120, 255});
+    draw_text(renderer, assets->font, message, 245, 320, (SDL_Color){235, 240, 245, 255});
+}
+
 static void render(SDL_Renderer *renderer, Assets *assets, const ViewState *view,
-                   const TaskUi *task, int show_role, const char *role) {
+                   const TaskUi *task, const VoteUi *vote_ui, int show_role, const char *role,
+                   int show_vote_result, const char *vote_result) {
     if (strcmp(view->phase, "LOBBY") == 0) {
         render_lobby(renderer, assets, view);
     } else {
-        render_game(renderer, assets, view);
+        render_game(renderer, assets, view, vote_ui);
     }
     render_task_overlay(renderer, assets, task);
+    render_killed_overlay(renderer, assets, view);
     if (show_role) {
         render_role_overlay(renderer, assets, role);
+    }
+    if (show_vote_result) {
+        render_vote_result_overlay(renderer, assets, vote_result);
     }
     SDL_RenderPresent(renderer);
 }
 
-static void ask_and_send_id(ClientRuntime *runtime, const char *prefix, const char *prompt) {
-    char input[32];
-    char command[64];
-    printf("%s", prompt);
-    fflush(stdout);
-    if (fgets(input, sizeof(input), stdin)) {
-        input[strcspn(input, "\r\n")] = '\0';
-        snprintf(command, sizeof(command), "%s %s", prefix, input);
-        net_send_line(runtime->socket_fd, command);
-    }
-}
-
 static void handle_task_key(TaskUi *task, SDL_Event *event) {
+    if (task->mode == TASK_UI_PROGRESS && task->kind == TASK_KIND_CARD &&
+        event->type == SDL_KEYDOWN && event->key.keysym.sym == SDLK_RIGHT) {
+        if (task->card_steps < 7) task->card_steps++;
+        if (task->card_steps >= 7) {
+            task->mode = TASK_UI_DONE;
+            task->started_at = SDL_GetTicks();
+            copy_text(task->status, sizeof(task->status), "Card accepted");
+        }
+        return;
+    }
+
     if (task->mode != TASK_UI_INPUT_CODE) return;
 
     if (event->type == SDL_TEXTINPUT) {
@@ -722,7 +821,52 @@ static void handle_task_key(TaskUi *task, SDL_Event *event) {
     }
 }
 
-static void handle_action_key(ClientRuntime *runtime, TaskUi *task, const ViewState *snapshot, SDL_Keycode key) {
+static int handle_vote_key(ClientRuntime *runtime, VoteUi *vote_ui, const ViewState *snapshot, SDL_Event *event) {
+    const ViewPlayer *me = local_player(snapshot);
+    if (strcmp(snapshot->phase, "MEETING") != 0 || !me || !me->alive || vote_ui->vote_sent) return 0;
+    if (event->type != SDL_KEYDOWN || event->key.repeat != 0) return 0;
+
+    SDL_Keycode key = event->key.keysym.sym;
+    if (key >= SDLK_0 && key <= SDLK_9) {
+        int len = (int)strlen(vote_ui->input);
+        if (len < 7) {
+            vote_ui->input[len] = (char)('0' + (key - SDLK_0));
+            vote_ui->input[len + 1] = '\0';
+        }
+        vote_ui->message[0] = '\0';
+        return 1;
+    }
+    if (key == SDLK_BACKSPACE) {
+        int len = (int)strlen(vote_ui->input);
+        if (len > 0) vote_ui->input[len - 1] = '\0';
+        return 1;
+    }
+    if (key == SDLK_RETURN || key == SDLK_KP_ENTER) {
+        int target_id = atoi(vote_ui->input);
+        if (vote_ui->input[0] == '\0') {
+            copy_text(vote_ui->message, sizeof(vote_ui->message), "Type an ID first");
+            return 1;
+        }
+        if (target_id != 0) {
+            const ViewPlayer *target = find_view_player(snapshot, target_id);
+            if (!target || !target->alive) {
+                copy_text(vote_ui->message, sizeof(vote_ui->message), "You can only vote for alive players");
+                vote_ui->input[0] = '\0';
+                return 1;
+            }
+        }
+        char command[32];
+        snprintf(command, sizeof(command), "VOTE %d", target_id);
+        net_send_line(runtime->socket_fd, command);
+        vote_ui->vote_sent = 1;
+        copy_text(vote_ui->message, sizeof(vote_ui->message), "Vote sent");
+        return 1;
+    }
+    return 0;
+}
+
+static void handle_action_key(ClientRuntime *runtime, TaskUi *task, const ViewState *snapshot,
+                              unsigned int local_completed_tasks, SDL_Keycode key) {
     if (task->mode != TASK_UI_NONE) {
         if (key == SDLK_ESCAPE) {
             task->mode = TASK_UI_NONE;
@@ -735,9 +879,11 @@ static void handle_action_key(ClientRuntime *runtime, TaskUi *task, const ViewSt
         case SDLK_e: {
             const ViewPlayer *me = local_player(snapshot);
             TaskKind kind = me ? task_kind_at(snapshot, me->x, me->y) : TASK_KIND_NONE;
+            int task_index = me ? task_index_at(snapshot, me->x, me->y) : -1;
             if (me && strcmp(snapshot->phase, "RUNNING") == 0 &&
-                strcmp(me->role, "crewmate") == 0 && kind != TASK_KIND_NONE) {
-                start_task_ui(task, kind);
+                strcmp(me->role, "crewmate") == 0 && kind != TASK_KIND_NONE &&
+                task_index >= 0 && !(local_completed_tasks & (1u << task_index))) {
+                start_task_ui(task, kind, task_index);
             } else {
                 net_send_line(runtime->socket_fd, "TASK");
             }
@@ -746,7 +892,7 @@ static void handle_action_key(ClientRuntime *runtime, TaskUi *task, const ViewSt
         case SDLK_r: net_send_line(runtime->socket_fd, "REPORT"); break;
         case SDLK_x: net_send_line(runtime->socket_fd, "START"); break;
         case SDLK_l: net_send_line(runtime->socket_fd, "RESET"); break;
-        case SDLK_v: ask_and_send_id(runtime, "VOTE", "ID do glosu, 0 = skip: "); break;
+        case SDLK_v: break;
         case SDLK_k: {
             const ViewPlayer *me = local_player(snapshot);
             if (me && strcmp(me->role, "impostor") == 0) {
@@ -936,16 +1082,23 @@ int main(int argc, char **argv) {
     InterlockedExchange(&runtime.running, 1);
     InitializeCriticalSection(&runtime.view_mutex);
     init_view(&runtime.view);
+    parse_welcome(&runtime.view, response);
 
     net_send_line(socket_fd, "STATE");
     CreateThread(NULL, 0, receive_thread, &runtime, 0, NULL);
 
     Uint32 last_move_time = 0;
     Uint32 role_reveal_until = 0;
+    Uint32 vote_result_until = 0;
     char revealed_role[16] = "";
+    char vote_result_message[128] = "";
     char previous_phase[24] = "LOBBY";
+    int seen_vote_result_version = 0;
+    unsigned int local_completed_tasks = 0;
     TaskUi task;
+    VoteUi vote_ui;
     memset(&task, 0, sizeof(task));
+    memset(&vote_ui, 0, sizeof(vote_ui));
 
     while (InterlockedCompareExchange(&runtime.running, 1, 1)) {
         ViewState snapshot;
@@ -954,11 +1107,28 @@ int main(int argc, char **argv) {
         LeaveCriticalSection(&runtime.view_mutex);
 
         if (strcmp(previous_phase, "LOBBY") == 0 && strcmp(snapshot.phase, "RUNNING") == 0) {
+            local_completed_tasks = 0;
             const ViewPlayer *me = local_player(&snapshot);
             if (me) {
                 copy_text(revealed_role, sizeof(revealed_role), me->role);
                 role_reveal_until = SDL_GetTicks() + 3000;
             }
+        }
+        if (strcmp(snapshot.phase, "LOBBY") == 0) {
+            local_completed_tasks = 0;
+        }
+        if (strcmp(previous_phase, "MEETING") != 0 && strcmp(snapshot.phase, "MEETING") == 0) {
+            memset(&vote_ui, 0, sizeof(vote_ui));
+        }
+        if (strcmp(snapshot.phase, "MEETING") != 0) {
+            vote_ui.input[0] = '\0';
+            vote_ui.vote_sent = 0;
+            vote_ui.message[0] = '\0';
+        }
+        if (snapshot.vote_result_version != seen_vote_result_version) {
+            seen_vote_result_version = snapshot.vote_result_version;
+            copy_text(vote_result_message, sizeof(vote_result_message), snapshot.vote_result);
+            vote_result_until = SDL_GetTicks() + 3500;
         }
         copy_text(previous_phase, sizeof(previous_phase), snapshot.phase);
 
@@ -968,22 +1138,27 @@ int main(int argc, char **argv) {
                 net_send_line(runtime.socket_fd, "QUIT");
                 InterlockedExchange(&runtime.running, 0);
             } else if (event.type == SDL_TEXTINPUT || event.type == SDL_KEYDOWN) {
+                if (handle_vote_key(&runtime, &vote_ui, &snapshot, &event)) {
+                    continue;
+                }
                 handle_task_key(&task, &event);
                 if (event.type == SDL_KEYDOWN && event.key.repeat == 0) {
-                    handle_action_key(&runtime, &task, &snapshot, event.key.keysym.sym);
+                    handle_action_key(&runtime, &task, &snapshot, local_completed_tasks, event.key.keysym.sym);
                 }
             } else if (event.type == SDL_KEYDOWN && event.key.repeat == 0) {
-                handle_action_key(&runtime, &task, &snapshot, event.key.keysym.sym);
+                handle_action_key(&runtime, &task, &snapshot, local_completed_tasks, event.key.keysym.sym);
             }
         }
 
-        advance_task_ui(&task, &runtime);
+        advance_task_ui(&task, &runtime, &local_completed_tasks);
         send_continuous_movement(&runtime, &last_move_time, &task);
 
         EnterCriticalSection(&runtime.view_mutex);
         snapshot = runtime.view;
         LeaveCriticalSection(&runtime.view_mutex);
-        render(renderer, &assets, &snapshot, &task, SDL_GetTicks() < role_reveal_until, revealed_role);
+        render(renderer, &assets, &snapshot, &task, &vote_ui,
+               SDL_GetTicks() < role_reveal_until, revealed_role,
+               SDL_GetTicks() < vote_result_until, vote_result_message);
         SDL_Delay(16);
     }
 

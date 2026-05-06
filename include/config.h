@@ -28,7 +28,7 @@ static const int TASK_SPOTS[TASK_SPOT_COUNT][2] = {
 };
 
 static const char TASK_TYPES[TASK_SPOT_COUNT] = {
-    'P', 'C', 'P', 'C', 'P', 'C', 'P', 'C'
+    'S', 'C', 'S', 'C', 'P', 'S', 'P', 'C'
 };
 
 static const int WALLS[WALL_COUNT][4] = {

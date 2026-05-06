@@ -42,9 +42,14 @@ Sterowanie w kliencie SDL:
   E           rozpoczecie minitaska przez crewmate stojacego na polu T
   K           zabicie najblizszego crewmate'a przez impostora
   R           report tylko po podejsciu do ciala
-  V           glosowanie na gracza albo pominiecie glosu
+  V           glosowanie odbywa sie w oknie spotkania przez wpisanie ID i Enter
   L           powrot do lobby po zakonczeniu gry
   Q           wyjscie
+
+Glosowanie:
+  Podczas meetingu zywy gracz wpisuje w oknie ID zywego gracza i wciska Enter.
+  Wpisanie 0 oznacza skip. Martwi gracze nie moga glosowac, nie da sie glosowac
+  na martwych graczy, a kazdy zywy gracz ma tylko jeden glos na spotkanie.
 
 Taski:
   Sa dwa oddzielne typy taskow.
@@ -52,6 +57,8 @@ Taski:
   CODE: trzy serie kodow; gra pokazuje 4 cyfry na chwile, a gracz musi je wpisac
   z pamieci. Dopiero po trzech poprawnych seriach serwer dostaje informacje
   o ukonczeniu taska.
+  CARD: przesuwanie karty; naciskaj kilka razy strzalke w prawo, az karta
+  przejedzie przez czytnik i pasek postepu sie wypelni.
 
 Widocznosc:
   Crewmate ma male, okragle pole widzenia wokol postaci.

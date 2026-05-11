@@ -1,16 +1,17 @@
 CC=gcc
 CFLAGS=-std=c11 -Wall -Wextra -Wpedantic -Iinclude
 LDFLAGS=-lws2_32
-SDL_CFLAGS=-IC:/msys64/ucrt64/include/SDL2
-SDL_LDFLAGS=-LC:/msys64/ucrt64/lib -lmingw32 -lSDL2main -lSDL2_ttf -lSDL2 -lws2_32
+SDL_DIR=third_party/SDL2
+SDL_CFLAGS=-I$(SDL_DIR)/include
+SDL_LDFLAGS=-L$(SDL_DIR)/lib -lmingw32 -lSDL2main -lSDL2_ttf -lSDL2 -lws2_32
 
 SERVER_OBJS=src/server.o src/game_state.o src/event_queue.o src/net.o
 CLIENT_OBJS=src/client.o src/net.o
 SDL_CLIENT_OBJS=src/sdl_client.o src/net.o
 
-.PHONY: all clean run-server run-client
+.PHONY: all clean copy-sdl-dlls run-server run-client run-sdl-client
 
-all: server.exe client.exe sdl_client.exe
+all: server.exe client.exe sdl_client.exe copy-sdl-dlls
 
 server.exe: $(SERVER_OBJS)
 	$(CC) $(SERVER_OBJS) -o $@ $(LDFLAGS)
@@ -20,6 +21,9 @@ client.exe: $(CLIENT_OBJS)
 
 sdl_client.exe: $(SDL_CLIENT_OBJS)
 	$(CC) $(SDL_CLIENT_OBJS) -o $@ $(SDL_LDFLAGS)
+
+copy-sdl-dlls:
+	powershell -NoProfile -ExecutionPolicy Bypass -Command "Copy-Item -Force '$(SDL_DIR)/bin/*.dll' '.'"
 
 src/%.o: src/%.c
 	$(CC) $(CFLAGS) -c $< -o $@

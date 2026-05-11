@@ -8,6 +8,15 @@ graczy i rozsyla aktualizacje do wszystkich klientow.
 Budowanie:
   mingw32-make
 
+Zaleznosci SDL:
+  Biblioteki SDL2 i SDL2_ttf sa dolaczone do repozytorium w katalogu
+  third_party/SDL2, wiec projekt nie wymaga juz instalowania SDL osobno ani
+  sciezek typu C:/msys64/ucrt64 w Makefile.
+
+  Do kompilacji nadal potrzebny jest toolchain MinGW-w64 zgodny z UCRT64 oraz
+  mingw32-make. Po zbudowaniu Makefile kopiuje wymagane pliki DLL z
+  third_party/SDL2/bin obok sdl_client.exe.
+
 Uruchomienie:
   .\server.exe 5050
   .\sdl_client.exe 127.0.0.1 5050
